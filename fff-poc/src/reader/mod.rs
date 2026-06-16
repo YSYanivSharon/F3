@@ -178,6 +178,100 @@ impl<R: Reader> FileReaderV2<R> {
             self.shared_dictionary_cache.as_ref(),
         )
     }
+
+    /// Total row count, taken from row-group metadata without decoding any data.
+    pub fn row_count(&self) -> u64 {
+        self.row_group_cnt_n_pointers
+            .iter()
+            .map(|p| p.row_count as u64)
+            .sum()
+    }
+
+    /// Streams the file one batch at a time — each batch is one encoding unit's
+    /// worth of rows across all (projected) columns — invoking `f` per batch and
+    /// dropping it before decoding the next. Peak memory is bounded by ~one
+    /// IOUnit per column regardless of file size, unlike `read_file` which
+    /// materializes the entire file at once. Used by the scan benchmark to avoid
+    /// OOM at large scale factors. Requires uniform `encoding_unit_len` across
+    /// columns (the writer default) and non-nested columns.
+    pub fn for_each_batch<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(RecordBatch) -> Result<()>,
+    {
+        let footer = Footer::try_new_with_projection(
+            &self.row_group_cnt_n_pointers,
+            self.grouped_column_metadata_buffers
+                .iter()
+                .map(|c_buffers| {
+                    c_buffers
+                        .iter()
+                        .map(|c_buffer| c_buffer.as_ref())
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            self.schema.clone(),
+        )?;
+        let shared_dictionary_cache = self.shared_dictionary_cache.as_ref().unwrap();
+        let schema = footer.schema();
+        for rg_meta in footer.row_group_metadatas() {
+            let fields: Vec<&Arc<Field>> = match &self.projections {
+                Projection::LeafColumnIndexes(idxs) => {
+                    idxs.iter().map(|&v| schema.fields().get(v).unwrap()).collect()
+                }
+                Projection::All => schema.fields().iter().collect(),
+            };
+            // One decoder per column, all sharing &self.reader (read_exact_at is
+            // &self), so they can be stepped in lockstep one encoding unit at a time.
+            let mut column_idx = ColumnIndexSequence::default();
+            let mut decoders = Vec::with_capacity(fields.len());
+            for &field in &fields {
+                decoders.push(create_logical_decoder(
+                    &self.reader,
+                    Arc::clone(field),
+                    &rg_meta.column_metadatas,
+                    &mut column_idx,
+                    self.wasm_context.clone(),
+                    shared_dictionary_cache,
+                    self.checksum_type,
+                )?);
+            }
+            loop {
+                let mut arrays = Vec::with_capacity(decoders.len());
+                let mut exhausted = 0usize;
+                for d in decoders.iter_mut() {
+                    match d.next_unit()? {
+                        Some(a) => arrays.push(a),
+                        None => exhausted += 1,
+                    }
+                }
+                if exhausted == decoders.len() {
+                    break; // all columns ended together (aligned)
+                }
+                if exhausted != 0 {
+                    return Err(Error::General(
+                        "F3 streaming scan: columns have misaligned encoding units \
+                         (non-uniform encoding_unit_len is unsupported)"
+                            .to_string(),
+                    ));
+                }
+                let batch = RecordBatch::try_new(
+                    Schema::new(
+                        arrays
+                            .iter()
+                            .zip(fields.iter())
+                            .map(|(a, f)| {
+                                Field::new(f.name(), a.data_type().clone(), f.is_nullable())
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .into(),
+                    arrays,
+                )?;
+                f(batch)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn get_metadata_buffer<R: Reader>(reader: &R, post_script: &PostScript) -> Result<MutableBuffer> {
@@ -190,6 +284,74 @@ fn get_metadata_buffer<R: Reader>(reader: &R, post_script: &PostScript) -> Resul
         reader.size()? - POSTSCRIPT_SIZE - post_script.metadata_size as u64,
     )?;
     Ok(buffer)
+}
+
+/// Decodes a single row group (or the rows selected within it) into
+/// RecordBatches. This is the per-row-group body shared by `read_file` (every
+/// group) and `read_row_group` (one group), so a scan can stream one row group
+/// at a time with memory bounded by the row-group size instead of materializing
+/// the whole file at once.
+#[allow(clippy::too_many_arguments)]
+fn decode_row_group<R: Reader>(
+    reader: &mut R,
+    schema: &SchemaRef,
+    rg_meta: &GroupedColumnMetadata,
+    selection_in_rg: &Selection,
+    projections: &Projection,
+    wasm_context: Option<Arc<WASMReadingContext<R>>>,
+    shared_dictionary_cache: &SharedDictionaryCache,
+    checksum_type: Option<ChecksumType>,
+) -> Result<Vec<RecordBatch>> {
+    let mut column_idx = ColumnIndexSequence::default();
+    let mut columns = vec![];
+    let mut decode_col = |field: &Arc<Field>| -> Result<()> {
+        let mut col_decoder = create_logical_decoder(
+            reader,
+            Arc::clone(field),
+            &rg_meta.column_metadatas,
+            &mut column_idx,
+            wasm_context.as_ref().map(Arc::clone),
+            shared_dictionary_cache,
+            checksum_type,
+        )?;
+        let arrays = if let Selection::RowIndexes(row_indexes) = selection_in_rg {
+            col_decoder.decode_row_at(row_indexes[0] as usize, 1)?
+        } else {
+            col_decoder.decode_batch()?
+        };
+        columns.push(arrays);
+        Ok(())
+    };
+    // TODO: needs some magic to handle nested data. Basically needs to go over the schema recursively
+    // and figure out which leaf nodes to fetch. Currently projection is only tested on flat data.
+    match projections {
+        Projection::LeafColumnIndexes(projected_indices) => projected_indices
+            .iter()
+            .try_for_each(|&v| decode_col(schema.fields().get(v).unwrap()))?,
+        Projection::All => {
+            for field in schema.fields().iter() {
+                // println!("decode col {field_id}");
+                decode_col(field)?;
+            }
+        }
+    }
+    let mut record_batches = vec![];
+    // TODO: vortex may not round-trip out the input Arrow type. https://github.com/spiraldb/vortex/issues/1021
+    for i in 0..columns[0].len() {
+        let columns_this_batch = columns.iter().map(|c| c[i].clone()).collect::<Vec<_>>();
+        record_batches.push(RecordBatch::try_new(
+            Schema::new(
+                columns_this_batch
+                    .iter()
+                    .zip(schema.fields().iter())
+                    .map(|(c, f)| Field::new(f.name(), c.data_type().clone(), f.is_nullable()))
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+            columns_this_batch,
+        )?);
+    }
+    Ok(record_batches)
 }
 
 fn read_file_based_on_footer<R: Reader>(
@@ -206,56 +368,18 @@ fn read_file_based_on_footer<R: Reader>(
     let rg_metas = footer.row_group_metadatas();
     // let projections = projections.map(|vec| vec.iter().map(|v| *v).collect::<HashSet<usize>>());
     let selected_rg_metas = process_selection(selection, rg_metas);
+    let schema = footer.schema();
     for (rg_meta, selection_in_rg) in selected_rg_metas {
-        let mut column_idx = ColumnIndexSequence::default();
-        let mut columns = vec![];
-        let mut decode_col = |field: &Arc<Field>| -> Result<()> {
-            let mut col_decoder = create_logical_decoder(
-                reader,
-                Arc::clone(field),
-                &rg_meta.column_metadatas,
-                &mut column_idx,
-                wasm_context.as_ref().map(Arc::clone),
-                shared_dictionary_cache,
-                checksum_type,
-            )?;
-            let arrays = if let Selection::RowIndexes(row_indexes) = &selection_in_rg {
-                col_decoder.decode_row_at(row_indexes[0] as usize, 1)?
-            } else {
-                col_decoder.decode_batch()?
-            };
-            columns.push(arrays);
-            Ok(())
-        };
-        // TODO: needs some magic to handle nested data. Basically needs to go over the schema recursively
-        // and figure out which leaf nodes to fetch. Currently projection is only tested on flat data.
-        match projections {
-            Projection::LeafColumnIndexes(projected_indices) => projected_indices
-                .iter()
-                .try_for_each(|&v| decode_col(footer.schema().fields().get(v).unwrap()))?,
-            Projection::All => {
-                for field in footer.schema().fields().iter() {
-                    // println!("decode col {field_id}");
-                    decode_col(field)?;
-                }
-            }
-        }
-        // TODO: vortex may not round-trip out the input Arrow type. https://github.com/spiraldb/vortex/issues/1021
-        for i in 0..columns[0].len() {
-            let columns_this_batch = columns.iter().map(|c| c[i].clone()).collect::<Vec<_>>();
-            record_batches.push(RecordBatch::try_new(
-                Schema::new(
-                    columns_this_batch
-                        .iter()
-                        .zip(footer.schema().fields().iter())
-                        .map(|(c, f)| Field::new(f.name(), c.data_type().clone(), f.is_nullable()))
-                        .collect::<Vec<_>>(),
-                )
-                .into(),
-                columns_this_batch,
-            )?);
-        }
-        // record_batches.push(RecordBatch::try_new(footer.schema().clone(), columns)?);
+        record_batches.extend(decode_row_group(
+            reader,
+            schema,
+            rg_meta,
+            &selection_in_rg,
+            projections,
+            wasm_context.clone(),
+            shared_dictionary_cache,
+            checksum_type,
+        )?);
     }
     Ok(record_batches)
 }

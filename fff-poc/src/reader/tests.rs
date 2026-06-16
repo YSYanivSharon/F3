@@ -1,4 +1,4 @@
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{DataType, Field, Schema};
 use fff_format::{File::fff::flatbuf::CompressionType, MAJOR_VERSION, MINOR_VERSION};
@@ -131,4 +131,56 @@ fn test_version_incompatibility() {
     let file = std::fs::File::open(path).unwrap();
     let mut reader = FileReaderV2Builder::new(Arc::new(file)).build().unwrap();
     let _output_batches = reader.read_file().unwrap();
+}
+
+/// Streaming a scan by encoding unit must yield exactly the same rows, in the
+/// same order, as reading the whole file. Forces multiple encoding units inside
+/// a SINGLE (default u64::MAX) row group via a small `encoding_unit_len`, so the
+/// streaming path is exercised without any writer row-group change.
+#[test]
+fn test_for_each_batch_matches_read_file() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int32, false),
+        Field::new("s", DataType::Utf8, true),
+    ]));
+    // Default options => one row group (u64::MAX). Each write_batch becomes one
+    // encoding unit, so several write_batch calls put several encoding units
+    // inside that single row group (the shape the convert path produces).
+    let mut file = tempfile::tempfile().unwrap();
+    {
+        let mut writer =
+            FileWriter::try_new(schema.clone(), &file, FileWriterOptions::default()).unwrap();
+        for g in 0..5i32 {
+            let base = g * 4;
+            let n = Int32Array::from((base..base + 4).collect::<Vec<i32>>());
+            let s =
+                StringArray::from((base..base + 4).map(|i| format!("row-{i}")).collect::<Vec<_>>());
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(n), Arc::new(s)]).unwrap();
+            writer.write_batch(&batch).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    file.rewind().unwrap();
+    let file = Arc::new(file);
+
+    // Reference: whole-file read.
+    let mut full = FileReaderV2Builder::new(file.clone()).build().unwrap();
+    let reference = full.read_file().unwrap();
+    assert_eq!(reference.iter().map(|b| b.num_rows()).sum::<usize>(), 20);
+    assert!(
+        reference.len() > 1,
+        "test needs multiple encoding units, got {}",
+        reference.len()
+    );
+
+    // Streaming: one encoding-unit batch at a time (bounded memory).
+    let reader = FileReaderV2Builder::new(file.clone()).build().unwrap();
+    let mut streamed = vec![];
+    reader.for_each_batch(|b| {
+        streamed.push(b);
+        Ok(())
+    }).unwrap();
+
+    assert_eq!(streamed, reference, "streamed read must equal whole-file read");
 }

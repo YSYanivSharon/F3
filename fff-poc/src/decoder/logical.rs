@@ -26,6 +26,15 @@ pub trait LogicalColDecoder {
     fn decode_batch(&mut self) -> Result<Vec<ArrayRef>>;
     /// Decode some rows out starting at row_id.
     fn decode_row_at(&mut self, row_id: usize, len: usize) -> Result<Vec<ArrayRef>>;
+    /// Pull the next encoding unit's array for this column (~one encoding-unit's
+    /// worth of rows), advancing internal state; `None` once the column is fully
+    /// consumed. Enables bounded-memory streaming scans (see
+    /// `FileReaderV2::for_each_batch`). Default: unsupported (e.g. nested columns).
+    fn next_unit(&mut self) -> Result<Option<ArrayRef>> {
+        Err(general_error!(
+            "next_unit (streaming scan) is not supported for this column type"
+        ))
+    }
 }
 
 /// A specific trait for testing select+proj performance of different nested implementation.
@@ -161,6 +170,41 @@ impl<R: Reader> LogicalColDecoder for PrimitiveColDecoder<'_, R> {
             remaining -= decoded;
         }
         Ok(arrays)
+    }
+
+    fn next_unit(&mut self) -> Result<Option<ArrayRef>> {
+        loop {
+            // Drain the current chunk's (IOUnit's) encoding units one at a time.
+            if let Some(cd) = self.chunk_decoder.as_mut() {
+                if let Some(array) = cd.decode_batch()? {
+                    return Ok(Some(array));
+                }
+                self.chunk_decoder = None;
+            }
+            // Current chunk exhausted (or none yet): advance to the next chunk.
+            match self.chunks_meta_iter.next() {
+                Some(chunk_meta) => {
+                    let encoded_chunk_buf = self.read_chunk(
+                        chunk_meta.offset(),
+                        chunk_meta.size_(),
+                        chunk_meta.checksum(),
+                    )?;
+                    self.chunk_decoder = Some(create_physical_decoder::<R>(
+                        chunk_meta
+                            .encunits()
+                            .ok_or_else(|| general_error!("No chunks in column meta"))?
+                            .iter(),
+                        chunk_meta.encoding_type(),
+                        chunk_meta.encoding_as_shared_dictionary(),
+                        &self.primitive_type,
+                        encoded_chunk_buf,
+                        self.wasm_context.as_ref().map(Arc::clone),
+                        Some(self.shared_dictionary_cache),
+                    )?);
+                }
+                None => return Ok(None),
+            }
+        }
     }
 }
 
