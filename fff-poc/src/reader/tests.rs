@@ -133,23 +133,22 @@ fn test_version_incompatibility() {
     let _output_batches = reader.read_file().unwrap();
 }
 
-/// Streaming a scan by encoding unit must yield exactly the same rows, in the
-/// same order, as reading the whole file. Forces multiple encoding units inside
-/// a SINGLE (default u64::MAX) row group via a small `encoding_unit_len`, so the
-/// streaming path is exercised without any writer row-group change.
+/// Streaming a scan one ROW GROUP at a time must yield exactly the same rows,
+/// in the same order, as reading the whole file. Uses a finite `row_group_size`
+/// so the file has multiple row groups, exercising the per-row-group streaming
+/// path that bounds scan memory.
 #[test]
-fn test_for_each_batch_matches_read_file() {
+fn test_for_each_row_group_matches_read_file() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("n", DataType::Int32, false),
         Field::new("s", DataType::Utf8, true),
     ]));
-    // Default options => one row group (u64::MAX). Each write_batch becomes one
-    // encoding unit, so several write_batch calls put several encoding units
-    // inside that single row group (the shape the convert path produces).
+    // Finite row groups of 8 rows; 5 write_batch calls of 4 rows = 20 rows total,
+    // which the writer splits into 3 row groups (8 + 8 + 4).
+    let options = FileWriterOptions::builder().set_row_group_size(8).build();
     let mut file = tempfile::tempfile().unwrap();
     {
-        let mut writer =
-            FileWriter::try_new(schema.clone(), &file, FileWriterOptions::default()).unwrap();
+        let mut writer = FileWriter::try_new(schema.clone(), &file, options).unwrap();
         for g in 0..5i32 {
             let base = g * 4;
             let n = Int32Array::from((base..base + 4).collect::<Vec<i32>>());
@@ -164,23 +163,29 @@ fn test_for_each_batch_matches_read_file() {
     file.rewind().unwrap();
     let file = Arc::new(file);
 
+    // row_count() (used by `info`) reads row-group metadata without decoding.
+    let total_rows = FileReaderV2Builder::new(file.clone()).build().unwrap().row_count();
+    assert_eq!(total_rows, 20, "expected 20 rows total");
+
     // Reference: whole-file read.
     let mut full = FileReaderV2Builder::new(file.clone()).build().unwrap();
     let reference = full.read_file().unwrap();
     assert_eq!(reference.iter().map(|b| b.num_rows()).sum::<usize>(), 20);
     assert!(
         reference.len() > 1,
-        "test needs multiple encoding units, got {}",
+        "test needs multiple row groups, got {}",
         reference.len()
     );
 
-    // Streaming: one encoding-unit batch at a time (bounded memory).
-    let reader = FileReaderV2Builder::new(file.clone()).build().unwrap();
+    // Streaming: one row group at a time (bounded memory).
+    let mut reader = FileReaderV2Builder::new(file.clone()).build().unwrap();
     let mut streamed = vec![];
-    reader.for_each_batch(|b| {
-        streamed.push(b);
-        Ok(())
-    }).unwrap();
+    reader
+        .for_each_row_group(|b| {
+            streamed.push(b);
+            Ok(())
+        })
+        .unwrap();
 
     assert_eq!(streamed, reference, "streamed read must equal whole-file read");
 }

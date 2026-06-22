@@ -187,14 +187,14 @@ impl<R: Reader> FileReaderV2<R> {
             .sum()
     }
 
-    /// Streams the file one batch at a time — each batch is one encoding unit's
-    /// worth of rows across all (projected) columns — invoking `f` per batch and
-    /// dropping it before decoding the next. Peak memory is bounded by ~one
-    /// IOUnit per column regardless of file size, unlike `read_file` which
-    /// materializes the entire file at once. Used by the scan benchmark to avoid
-    /// OOM at large scale factors. Requires uniform `encoding_unit_len` across
-    /// columns (the writer default) and non-nested columns.
-    pub fn for_each_batch<F>(&self, mut f: F) -> Result<()>
+    /// Streams the file one ROW GROUP at a time: decodes a whole row group,
+    /// invokes `f` for each of its RecordBatches, then drops the group before
+    /// decoding the next. Peak memory is bounded by one row group's decoded
+    /// size, so writing finite row groups (FileWriterOptions::set_row_group_size)
+    /// bounds scan memory regardless of file size — unlike `read_file`, which
+    /// materializes the whole file at once. Used by the scan benchmark to avoid
+    /// OOM at large scale factors.
+    pub fn for_each_row_group<F>(&mut self, mut f: F) -> Result<()>
     where
         F: FnMut(RecordBatch) -> Result<()>,
     {
@@ -211,66 +211,16 @@ impl<R: Reader> FileReaderV2<R> {
                 .collect(),
             self.schema.clone(),
         )?;
-        let shared_dictionary_cache = self.shared_dictionary_cache.as_ref().unwrap();
-        let schema = footer.schema();
-        for rg_meta in footer.row_group_metadatas() {
-            let fields: Vec<&Arc<Field>> = match &self.projections {
-                Projection::LeafColumnIndexes(idxs) => {
-                    idxs.iter().map(|&v| schema.fields().get(v).unwrap()).collect()
-                }
-                Projection::All => schema.fields().iter().collect(),
-            };
-            // One decoder per column, all sharing &self.reader (read_exact_at is
-            // &self), so they can be stepped in lockstep one encoding unit at a time.
-            let mut column_idx = ColumnIndexSequence::default();
-            let mut decoders = Vec::with_capacity(fields.len());
-            for &field in &fields {
-                decoders.push(create_logical_decoder(
-                    &self.reader,
-                    Arc::clone(field),
-                    &rg_meta.column_metadatas,
-                    &mut column_idx,
-                    self.wasm_context.clone(),
-                    shared_dictionary_cache,
-                    self.checksum_type,
-                )?);
-            }
-            loop {
-                let mut arrays = Vec::with_capacity(decoders.len());
-                let mut exhausted = 0usize;
-                for d in decoders.iter_mut() {
-                    match d.next_unit()? {
-                        Some(a) => arrays.push(a),
-                        None => exhausted += 1,
-                    }
-                }
-                if exhausted == decoders.len() {
-                    break; // all columns ended together (aligned)
-                }
-                if exhausted != 0 {
-                    return Err(Error::General(
-                        "F3 streaming scan: columns have misaligned encoding units \
-                         (non-uniform encoding_unit_len is unsupported)"
-                            .to_string(),
-                    ));
-                }
-                let batch = RecordBatch::try_new(
-                    Schema::new(
-                        arrays
-                            .iter()
-                            .zip(fields.iter())
-                            .map(|(a, f)| {
-                                Field::new(f.name(), a.data_type().clone(), f.is_nullable())
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .into(),
-                    arrays,
-                )?;
-                f(batch)?;
-            }
-        }
-        Ok(())
+        for_each_row_group_based_on_footer(
+            &mut self.reader,
+            footer,
+            &self.projections,
+            &self.selection,
+            self.wasm_context.clone(),
+            self.shared_dictionary_cache.as_ref(),
+            self.checksum_type,
+            &mut f,
+        )
     }
 }
 
@@ -288,9 +238,9 @@ fn get_metadata_buffer<R: Reader>(reader: &R, post_script: &PostScript) -> Resul
 
 /// Decodes a single row group (or the rows selected within it) into
 /// RecordBatches. This is the per-row-group body shared by `read_file` (every
-/// group) and `read_row_group` (one group), so a scan can stream one row group
-/// at a time with memory bounded by the row-group size instead of materializing
-/// the whole file at once.
+/// group) and `for_each_row_group` (one group at a time), so a scan can stream
+/// one row group at a time with memory bounded by the row-group size instead of
+/// materializing the whole file at once.
 #[allow(clippy::too_many_arguments)]
 fn decode_row_group<R: Reader>(
     reader: &mut R,
@@ -382,6 +332,45 @@ fn read_file_based_on_footer<R: Reader>(
         )?);
     }
     Ok(record_batches)
+}
+
+/// Like `read_file_based_on_footer`, but yields one row group at a time to `f`
+/// and drops it before decoding the next, so peak memory is bounded by a single
+/// row group rather than the whole file. Backs `FileReaderV2::for_each_row_group`.
+#[allow(clippy::too_many_arguments)]
+fn for_each_row_group_based_on_footer<R: Reader, F>(
+    reader: &mut R,
+    footer: Footer,
+    projections: &Projection,
+    selection: &Selection,
+    wasm_context: Option<Arc<WASMReadingContext<R>>>,
+    shared_dictionary_cache: Option<&SharedDictionaryCache>,
+    checksum_type: Option<ChecksumType>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: FnMut(RecordBatch) -> Result<()>,
+{
+    let shared_dictionary_cache = shared_dictionary_cache.unwrap();
+    let rg_metas = footer.row_group_metadatas();
+    let selected_rg_metas = process_selection(selection, rg_metas);
+    let schema = footer.schema();
+    for (rg_meta, selection_in_rg) in selected_rg_metas {
+        let batches = decode_row_group(
+            reader,
+            schema,
+            rg_meta,
+            &selection_in_rg,
+            projections,
+            wasm_context.clone(),
+            shared_dictionary_cache,
+            checksum_type,
+        )?;
+        for batch in batches {
+            f(batch)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]
